@@ -1,46 +1,55 @@
 import requests
 import os
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
-NOTION_VERSION = "2022-06-28"
-
 headers = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Notion-Version": NOTION_VERSION,
+    "Notion-Version": "2022-06-28",
     "Content-Type": "application/json"
 }
 
 SEARCH_URL = "https://api.notion.com/v1/search"
 PAGE_URL = "https://api.notion.com/v1/pages/"
+USER_URL = "https://api.notion.com/v1/users/"
 
 since = datetime.now(timezone.utc) - timedelta(hours=24)
 
 pages = {}
 parent_cache = {}
+user_cache = {}
+
 cursor = None
 
 
-# ----------------------------
-# ページタイトル取得
-# ----------------------------
-def get_page_title(page):
+def get_title(page):
 
     if page.get("properties"):
         for p in page["properties"].values():
-            if p["type"] == "title":
-                if p["title"]:
-                    return p["title"][0]["plain_text"]
+            if p["type"] == "title" and p["title"]:
+                return p["title"][0]["plain_text"]
 
     return "Untitled"
 
 
-# ----------------------------
-# 親階層取得（再帰）
-# ----------------------------
-def get_parent_path(parent):
+def get_user_name(user_id):
+
+    if user_id in user_cache:
+        return user_cache[user_id]
+
+    res = requests.get(USER_URL + user_id, headers=headers).json()
+
+    name = res.get("name", "unknown")
+
+    user_cache[user_id] = name
+
+    return name
+
+
+def get_parent_title(parent):
 
     if parent["type"] != "page_id":
         return None
@@ -52,31 +61,18 @@ def get_parent_path(parent):
 
     res = requests.get(PAGE_URL + pid, headers=headers).json()
 
-    title = get_page_title(res)
+    title = get_title(res)
 
-    parent_path = title
+    parent_cache[pid] = title
 
-    if res.get("parent") and res["parent"]["type"] == "page_id":
-        p = get_parent_path(res["parent"])
-        if p:
-            parent_path = p + " / " + parent_path
-
-    parent_cache[pid] = parent_path
-
-    return parent_path
+    return title
 
 
-# ----------------------------
-# 全ページ取得
-# ----------------------------
 while True:
 
     payload = {
         "filter": {"value": "page", "property": "object"},
-        "sort": {
-            "timestamp": "last_edited_time",
-            "direction": "descending"
-        },
+        "sort": {"timestamp": "last_edited_time", "direction": "descending"},
         "page_size": 100
     }
 
@@ -88,7 +84,7 @@ while True:
     for r in res["results"]:
 
         edited = datetime.fromisoformat(
-            r["last_edited_time"].replace("Z","+00:00")
+            r["last_edited_time"].replace("Z", "+00:00")
         )
 
         if edited < since:
@@ -99,7 +95,14 @@ while True:
         if page_id in pages:
             continue
 
-        title = get_page_title(r)
+        title = get_title(r)
+
+        parent_title = get_parent_title(r["parent"])
+
+        if parent_title:
+            path = parent_title + " / " + title
+        else:
+            path = title
 
         icon = ""
 
@@ -109,13 +112,12 @@ while True:
             else:
                 icon = "📄"
 
-        editor = r.get("last_edited_by", {}).get("name", "unknown")
+        editor = "unknown"
 
-        parent_path = get_parent_path(r["parent"])
-
-        path = title
-        if parent_path:
-            path = parent_path + " / " + title
+        if r.get("last_edited_by"):
+            uid = r["last_edited_by"].get("id")
+            if uid:
+                editor = get_user_name(uid)
 
         pages[page_id] = {
             "path": path,
@@ -131,20 +133,13 @@ while True:
     cursor = res["next_cursor"]
 
 
-# ----------------------------
-# 更新リスト
-# ----------------------------
 updates = list(pages.values())
 
 updates.sort(key=lambda x: x["time"], reverse=True)
 
 
-# ----------------------------
-# Discordメッセージ生成
-# ----------------------------
 if not updates:
-
-    messages = ["📘 Notion更新（過去24時間）：なし"]
+    raise SystemExit(0)
 
 else:
 
@@ -154,7 +149,9 @@ else:
 
     for u in updates:
 
-        t = u["time"].astimezone().strftime("%m-%d %H:%M")
+        t = u["time"].astimezone(
+            ZoneInfo("Asia/Tokyo")
+        ).strftime("%Y-%m-%d %H:%M")
 
         lines.append(
             f"{u['icon']} **{u['path']}**\n"
@@ -163,6 +160,7 @@ else:
         )
 
     messages = []
+
     current = header
 
     for line in lines:
@@ -176,12 +174,5 @@ else:
     messages.append(current)
 
 
-# ----------------------------
-# Discord送信
-# ----------------------------
 for m in messages:
-
-    try:
-        requests.post(DISCORD_WEBHOOK, json={"content": m})
-    except:
-        pass
+    requests.post(DISCORD_WEBHOOK, json={"content": m})
