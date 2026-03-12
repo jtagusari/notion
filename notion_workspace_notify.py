@@ -8,7 +8,7 @@ DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
 
 headers = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Notion-Version": "2022-06-28",
+    "Notion-Version": "2025-09-03",
     "Content-Type": "application/json"
 }
 
@@ -40,9 +40,23 @@ def get_user_name(user_id):
     if user_id in user_cache:
         return user_cache[user_id]
 
-    res = requests.get(USER_URL + user_id, headers=headers).json()
+    try:
+        resp = requests.get(USER_URL + user_id, headers=headers, timeout=20)
+    except requests.RequestException:
+        name = f"user:{user_id[:8]}"
+        user_cache[user_id] = name
+        return name
 
-    name = res.get("name", "unknown")
+    if not resp.ok:
+        name = f"user:{user_id[:8]}"
+        user_cache[user_id] = name
+        return name
+
+    res = resp.json()
+
+    # Some users may not expose a display name depending on permission and user type.
+    # Normalize full-width spaces to half-width for cleaner Discord output.
+    name = (res.get("name") or f"user:{user_id[:8]}").replace("\u3000", " ")
 
     user_cache[user_id] = name
 
@@ -51,21 +65,66 @@ def get_user_name(user_id):
 
 def get_parent_title(parent):
 
-    if parent["type"] != "page_id":
-        return None
+    if parent["type"] == "page_id":
+        pid = parent["page_id"]
 
-    pid = parent["page_id"]
+        if pid in parent_cache:
+            return parent_cache[pid]
 
-    if pid in parent_cache:
-        return parent_cache[pid]
+        res = requests.get(PAGE_URL + pid, headers=headers).json()
+        title = get_title(res)
+        
+        # Check if this page has a parent too (build full path)
+        if res.get("parent") and res["parent"]["type"] in ["page_id", "database_id", "data_source_id"]:
+            parent_of_parent = get_parent_title(res["parent"])
+            if parent_of_parent:
+                title = parent_of_parent + " / " + title
+        
+        parent_cache[pid] = title
+        return title
 
-    res = requests.get(PAGE_URL + pid, headers=headers).json()
+    elif parent["type"] == "database_id":
+        did = parent["database_id"]
 
-    title = get_title(res)
+        if did in parent_cache:
+            return parent_cache[did]
 
-    parent_cache[pid] = title
+        try:
+            res = requests.get(f"https://api.notion.com/v1/databases/{did}", headers=headers, timeout=20).json()
+            # Notion databases have a "title" field which is a list of rich text objects
+            if res.get("title"):
+                title = "".join(t.get("plain_text", "") for t in res["title"])
+            else:
+                title = "Untitled DB"
+        except Exception as e:
+            title = "Unknown DB"
 
-    return title
+        parent_cache[did] = title
+        return title
+
+    elif parent["type"] == "data_source_id":
+        # data_source_id parent contains a database_id field
+        did = parent.get("database_id")
+        if not did:
+            return None
+
+        if did in parent_cache:
+            return parent_cache[did]
+
+        try:
+            res = requests.get(f"https://api.notion.com/v1/databases/{did}", headers=headers, timeout=20).json()
+            # Notion databases have a "title" field which is a list of rich text objects
+            if res.get("title"):
+                title = "".join(t.get("plain_text", "") for t in res["title"])
+            else:
+                title = "Untitled DB"
+        except Exception as e:
+            title = "Unknown DB"
+
+        parent_cache[did] = title
+        return title
+
+    return None
 
 
 while True:
@@ -154,9 +213,8 @@ else:
         ).strftime("%Y-%m-%d %H:%M")
 
         lines.append(
-            f"{u['icon']} **{u['path']}**\n"
-            f"{u['url']}\n"
-            f"edited by {u['editor']} ({t})\n"
+            f"- {u['icon']} [**{u['path']}**]({u['url']})"
+            f" edited by {u['editor']} ({t})"
         )
 
     messages = []

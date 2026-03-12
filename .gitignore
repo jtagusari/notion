@@ -1,2 +1,4 @@
 sync_google_calender.gs
 __pycache__/
+notion-project/
+.env
